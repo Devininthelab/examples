@@ -3,6 +3,26 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from datautils import MyTrainDataset
 
+import torch.multiprocessing as mp # Wrapper around python native multiprocessing
+from torch.utils.data.distributed import DistributedSampler # middle man takeing input data and distributed it into multiple GPUs
+from torch.nn.parallel import DistributedDataParallel as DDP # wrapper around model to make it distributed
+from torch.distributed import init_process_group, destroy_process_group # for initializing and destroying the process group
+
+import os
+
+# world_size is the total number of processes in a group
+# rank is the unique id of each process in the group [0 to world_size-1]
+
+def ddp_setup(rank, world_size, gpu_ids):
+    """
+    Args:
+        rank: Unique indentifier of each process
+        world_size: Total number of processes in the group
+    """
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355' # just a free part
+    init_process_group(backend="nccl", rank=rank, world_size=world_size) # nccl is NVIDIA's library for collective communication
+    torch.cuda.set_device(gpu_ids[rank]) # set the device for each process
 
 class Trainer:
     def __init__(
@@ -18,6 +38,7 @@ class Trainer:
         self.train_data = train_data
         self.optimizer = optimizer
         self.save_every = save_every
+        self.model = DDP(self.model, device_ids=[self.gpu_id]) # wrap the model with DDP
 
     def _run_batch(self, source, targets):
         self.optimizer.zero_grad()
@@ -35,7 +56,7 @@ class Trainer:
             self._run_batch(source, targets)
 
     def _save_checkpoint(self, epoch):
-        ckp = self.model.state_dict()
+        ckp = self.model.module.state_dict()
         PATH = "checkpoint.pt"
         torch.save(ckp, PATH)
         print(f"Epoch {epoch} | Training checkpoint saved at {PATH}")
@@ -43,7 +64,7 @@ class Trainer:
     def train(self, max_epochs: int):
         for epoch in range(max_epochs):
             self._run_epoch(epoch)
-            if epoch % self.save_every == 0:
+            if self.gpu_id == 0 and epoch % self.save_every == 0: # only save from one GPU
                 self._save_checkpoint(epoch)
 
 
@@ -59,15 +80,18 @@ def prepare_dataloader(dataset: Dataset, batch_size: int):
         dataset,
         batch_size=batch_size,
         pin_memory=True,
-        shuffle=True
+        shuffle=False,  # shuffle is handled by DistributedSampler
+        sampler=DistributedSampler(dataset),  # distribute the data across GPUs
     )
 
 
-def main(device, total_epochs, save_every, batch_size):
+def main(rank: int, world_size:int, total_epochs: int, save_every: int, batch_size:int, gpu_ids: list):
+    ddp_setup(rank, world_size, gpu_ids) # initialize the process group
     dataset, model, optimizer = load_train_objs()
     train_data = prepare_dataloader(dataset, batch_size)
-    trainer = Trainer(model, train_data, optimizer, device, save_every)
+    trainer = Trainer(model, train_data, optimizer, gpu_ids[rank], save_every)
     trainer.train(total_epochs)
+    destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -77,6 +101,14 @@ if __name__ == "__main__":
     parser.add_argument('save_every', type=int, help='How often to save a snapshot')
     parser.add_argument('--batch_size', default=32, type=int, help='Input batch size on each device (default: 32)')
     args = parser.parse_args()
+
+    gpu_ids = [0, 3]
+    world_size = len(gpu_ids) # number of GPUs available
+    print(f"Number of GPUs: {world_size}")
     
-    device = 0  # shorthand for cuda:0
-    main(device, args.total_epochs, args.save_every, args.batch_size)
+    mp.spawn(
+        main, 
+        args=(world_size, args.total_epochs, args.save_every, args.batch_size, gpu_ids),
+        nprocs=world_size,
+        join=True,
+    )
